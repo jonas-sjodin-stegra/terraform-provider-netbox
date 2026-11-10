@@ -9,6 +9,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+
+	"github.com/e-breuninger/terraform-provider-netbox/internal/netboxapi"
+	"github.com/fbreckle/go-netbox/netbox/client/dcim"
 )
 
 // componentDeps is the catalog a device component needs: the device catalog plus a device. The
@@ -707,6 +710,63 @@ resource "netbox_inventory_item" "test" {
 					resource.TestCheckResourceAttr("netbox_inventory_item_role.test", "color_hex", "9e9e9e"),
 				),
 			},
+		},
+	})
+}
+
+func TestAccNetboxVirtualChassisMaster(t *testing.T) {
+	name := testAccGetTestName("vcmaster")
+	var chassisID int64
+	deps := deviceDeps(name) + fmt.Sprintf(`
+resource "netbox_virtual_chassis" "test" { name = "%[1]s" }
+resource "netbox_device" "a" {
+  name = "%[1]s-a"
+  device_type_id = netbox_device_type.test.id
+  role_id = netbox_device_role.test.id
+  site_id = netbox_site.test.id
+  virtual_chassis_id = netbox_virtual_chassis.test.id
+  virtual_chassis_position = 1
+}
+resource "netbox_device" "b" {
+  name = "%[1]s-b"
+  device_type_id = netbox_device_type.test.id
+  role_id = netbox_device_role.test.id
+  site_id = netbox_site.test.id
+  virtual_chassis_id = netbox_virtual_chassis.test.id
+  virtual_chassis_position = 2
+}
+data "netbox_virtual_chassis" "test" {
+  id = netbox_virtual_chassis.test.id
+  depends_on = [netbox_virtual_chassis_master.test]
+}`, name)
+	config := func(device string) string {
+		return deps + fmt.Sprintf(`
+resource "netbox_virtual_chassis_master" "test" {
+  virtual_chassis_id = netbox_virtual_chassis.test.id
+  device_id = netbox_device.%s.id
+}`, device)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		PreCheck:                 func() { testAccPreCheck(t) },
+		Steps: []resource.TestStep{
+			{Config: config("a"), Check: resource.ComposeTestCheckFunc(
+				stateID("netbox_virtual_chassis.test", &chassisID),
+				resource.TestCheckResourceAttrPair("netbox_virtual_chassis_master.test", "device_id", "netbox_device.a", "id"),
+				resource.TestCheckResourceAttrPair("data.netbox_virtual_chassis.test", "master_id", "netbox_device.a", "id"),
+			)},
+			{PreConfig: func() {
+				client, err := testAccClient()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = client.Dcim.DcimVirtualChassisPartialUpdate(dcim.NewDcimVirtualChassisPartialUpdateParams().WithID(chassisID), nil, netboxapi.WithBody(map[string]any{"master": nil}))
+				if err != nil {
+					t.Fatalf("clear master out of band: %v", err)
+				}
+			}, Config: config("a"), Check: resource.TestCheckResourceAttrPair("data.netbox_virtual_chassis.test", "master_id", "netbox_device.a", "id")},
+			{ResourceName: "netbox_virtual_chassis_master.test", ImportState: true, ImportStateVerify: true},
+			{Config: config("b"), Check: resource.TestCheckResourceAttrPair("data.netbox_virtual_chassis.test", "master_id", "netbox_device.b", "id")},
 		},
 	})
 }
